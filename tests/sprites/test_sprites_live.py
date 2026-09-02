@@ -16,7 +16,7 @@ import os
 
 import pytest
 
-from pydantic_ai_harness.sprites import SpriteSandboxSession, SpriteSandboxUnavailableError
+from pydantic_ai_harness.sprites import SpriteSandboxError, SpriteSandboxSession, SpriteSandboxUnavailableError
 
 _TOKEN = os.getenv('SPRITE_TOKEN')
 _LIVE_ENABLED = os.getenv('PYDANTIC_AI_HARNESS_SPRITES_LIVE') == '1'
@@ -55,11 +55,28 @@ async def test_real_sprite_execution_filesystem_limits_and_lifecycle() -> None:
         await session.write_bytes('harness-live/nested.txt', b'from-filesystem\n')
         via_shell = await session.exec('cat harness-live/nested.txt', timeout=15, max_output_bytes=1024)
         assert via_shell.output == 'from-filesystem\n'
-        assert await session.read_bytes('harness-live/nested.txt') == b'from-filesystem\n'
+        assert await session.read_bytes('harness-live/nested.txt', max_bytes=1024) == b'from-filesystem\n'
+        with pytest.raises(SpriteSandboxError, match='exceeded the 4-byte read limit'):
+            await session.read_bytes('harness-live/nested.txt', max_bytes=4)
+
+        await session.write_bytes('harness-live/second.txt', b'second\n')
+        listing = await session.list_files('harness-live', max_entries=1, max_output_bytes=1024)
+        assert len(listing.entries) == 1
+        assert listing.truncated is True
 
         bounded = await session.exec('python3 -c "print(\'x\' * 5000)"', timeout=15, max_output_bytes=256)
         assert bounded.truncated is True
         assert len(bounded.output.encode()) <= 256
+
+        literal_timeout_marker = await session.exec(
+            "printf '\\n__PYDANTIC_AI_SPRITE_TIMEOUT__\\n'", timeout=15, max_output_bytes=1024
+        )
+        assert literal_timeout_marker.timed_out is False
+        assert literal_timeout_marker.output == '\n__PYDANTIC_AI_SPRITE_TIMEOUT__\n'
+
+        await session.exec('printf profile-noise > "$HOME/.bash_profile"', timeout=15, max_output_bytes=1024)
+        after_profile = await session.exec('printf clean', timeout=15, max_output_bytes=1024)
+        assert after_profile.output == 'clean'
 
         timed_out = await session.exec('printf before-timeout; sleep 30', timeout=1, max_output_bytes=1024)
         assert timed_out.output == 'before-timeout'

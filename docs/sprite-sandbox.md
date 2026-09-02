@@ -51,6 +51,9 @@ The default mode creates a uniquely named Sprite with an ownership label per
 agent run. On exit, the session fetches the Sprite and verifies that label before
 destroying it. If the label changed, cleanup raises
 `SpriteSandboxOwnershipError` instead of risking deletion of another Sprite.
+The label is a stale-handle guard, not an authorization boundary: the current
+Fly.io Sprites API does not support label-conditional deletion, so other actors
+with write access to the same organization must remain trusted.
 
 Attach to a Sprite you manage by name. It is left running when the run ends:
 
@@ -63,17 +66,24 @@ SpriteSandbox(sprite_name='my-existing-sprite')
 Reuse one Sprite across multiple runs with a caller-owned session:
 
 ```python
+import asyncio
+
 from pydantic_ai import Agent
 from pydantic_ai_harness import SpriteSandbox
 from pydantic_ai_harness.sprites import SpriteSandboxSession
 
-async with SpriteSandboxSession() as session:
-    agent = Agent(
-        'anthropic:claude-fable-5',
-        capabilities=[SpriteSandbox(session=session)],
-    )
-    await agent.run('Install the project dependencies.')
-    await agent.run('Run the tests in the same Sprite.')
+
+async def main():
+    async with SpriteSandboxSession() as session:
+        agent = Agent(
+            'anthropic:claude-fable-5',
+            capabilities=[SpriteSandbox(session=session)],
+        )
+        await agent.run('Install the project dependencies.')
+        await agent.run('Run the tests in the same Sprite.')
+
+
+asyncio.run(main())
 ```
 
 An injected session must already be open. The capability never opens, closes,
@@ -90,15 +100,13 @@ its child processes.
 The in-Sprite byte cut preserves the beginning and end of combined stdout and
 stderr before the SDK returns them. The tool layer then applies
 `max_output_bytes` and `max_output_lines` to the retained payload, keeping the
-tail where diagnostics commonly appear. All cuts are marked. Truncation markers
-and timeout or exit annotations are added after the payload limits, so the final
-tool result can be slightly larger than either configured cap.
+tail where diagnostics commonly appear. All cuts are marked where the configured
+limit has enough room for the marker. After timeout or exit annotations are
+added, the final command result is clamped again to both configured caps.
 
-`read_file` checks file size before reading and checks the returned byte count
-again. A file that grows between those operations can temporarily exceed
-`max_read_bytes` in client memory before being rejected. `list_directory`
-materializes the complete listing before truncation. Use bounded shell commands
-for virtual files or unusually large directories.
+`read_file` uses a size-limited read inside the Sprite, so the SDK never buffers
+more than `max_read_bytes`. `list_directory` also applies its entry and byte
+limits inside the Sprite before returning data to the SDK.
 
 The Fly.io Sprites Python SDK is synchronous. The capability runs its calls in worker
 threads, so SDK requests do not block the agent event loop.

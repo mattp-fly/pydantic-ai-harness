@@ -20,6 +20,7 @@ from pydantic_ai_harness.sprites import (
     SpriteSandboxError,
     SpriteSandboxSession,
 )
+from pydantic_ai_harness.sprites._toolset import SpriteSandboxToolset
 
 from .fake_sprites import FakeAuthenticationError, FakeExecResult, FakeSpriteError, FakeSprites
 
@@ -115,8 +116,7 @@ class TestTools:
         assert call.env is not None and call.env['PYDANTIC_AI_SPRITE_TIMEOUT_SECONDS'] == '10'
 
     async def test_reports_no_output_and_timeout(self, fake_sprites: FakeSprites) -> None:
-        marker = b'\n__PYDANTIC_AI_SPRITE_TIMEOUT__\n'
-        fake_sprites.responder = lambda call: FakeExecResult(stdout=marker, returncode=124)
+        fake_sprites.responder = lambda call: FakeExecResult(stderr=b'\0\1', returncode=124)
         async with _toolset() as tools:
             assert await tools.run_command('sleep', timeout_seconds=3) == '(no output)\n[timed out after 3s]'
 
@@ -134,11 +134,19 @@ class TestTools:
 
     async def test_truncates_lines_and_marks_session_cut(self, fake_sprites: FakeSprites) -> None:
         marker = b'\n[... Sprite command output truncated ...]\n'
-        fake_sprites.responder = lambda call: FakeExecResult(stdout=b'one\ntwo\nthree' + marker + b'end')
+        fake_sprites.responder = lambda call: FakeExecResult(
+            stdout=b'one\ntwo\nthree' + marker + b'end', stderr=b'\1\0'
+        )
         async with _toolset(max_output_lines=1) as tools:
             result = await tools.run_command('big')
-        assert 'output truncated' in result
         assert result.endswith('end')
+
+    async def test_final_command_result_honors_tiny_caps(self, fake_sprites: FakeSprites) -> None:
+        fake_sprites.responder = lambda call: FakeExecResult(stdout=b'x', stderr=b'\1\0', returncode=2)
+        async with _toolset(max_output_bytes=1, max_output_lines=1) as tools:
+            result = await tools.run_command('big')
+        assert len(result.encode()) <= 1
+        assert len(result.splitlines()) <= 1
 
     async def test_sdk_error_becomes_model_retry(self, fake_sprites: FakeSprites) -> None:
         async with _toolset() as tools:
@@ -160,6 +168,21 @@ class TestTools:
             )
             assert await tools.list_directory('.') == 'dir/'
 
+    async def test_read_limit_is_enforced_during_the_read(self, fake_sprites: FakeSprites) -> None:
+        async with _toolset(max_read_bytes=10) as tools:
+            await tools.write_file('growing.txt', 'x' * 100)
+            with pytest.raises(ModelRetry, match='exceeded the 10-byte read limit'):
+                await tools.read_file('growing.txt')
+
+    async def test_directory_listing_is_bounded_before_transfer(self, fake_sprites: FakeSprites) -> None:
+        async with _toolset(max_output_lines=2, max_output_bytes=100) as tools:
+            for name in ('a', 'b', 'c'):
+                await tools.write_file(name, name)
+            result = await tools.list_directory('.')
+        assert result.startswith('[... directory listing truncated ...]')
+        assert len(result.encode()) <= 100
+        assert len(result.splitlines()) <= 2
+
     async def test_empty_directory(self, fake_sprites: FakeSprites) -> None:
         async with _toolset() as tools:
             assert await tools.list_directory('/empty') == '(empty)'
@@ -167,7 +190,7 @@ class TestTools:
     async def test_file_error_becomes_model_retry(self, fake_sprites: FakeSprites) -> None:
         async with _toolset() as tools:
             fake_sprites.filesystem_error = FakeSpriteError('disk issue')
-            with pytest.raises(ModelRetry, match="Could not read 'x': Could not stat 'x': disk issue"):
+            with pytest.raises(ModelRetry, match="Could not read 'x': disk issue"):
                 await tools.read_file('x')
             with pytest.raises(ModelRetry, match="Could not write 'x': disk issue"):
                 await tools.write_file('x', 'a')
@@ -212,3 +235,19 @@ class TestTools:
         run_toolset = await toolset.for_run(_context())
         with pytest.raises(SpriteSandboxError, match='not open'):
             await run_toolset.__aenter__()
+
+    async def test_owned_session_is_retained_when_cleanup_fails(self, fake_sprites: FakeSprites) -> None:
+        toolset = SpriteSandbox[None](token='token').get_toolset()
+        assert _is_toolset(toolset)
+        run_toolset = await toolset.for_run(_context())
+        assert isinstance(run_toolset, SpriteSandboxToolset)
+        await run_toolset.__aenter__()
+        fake_sprites.destroy_error = FakeSpriteError('control plane unavailable')
+        with pytest.raises(SpriteSandboxError, match='Could not destroy'):
+            await run_toolset.__aexit__(None, None, None)
+        assert run_toolset._session is not None
+        assert run_toolset._session.is_open
+
+        fake_sprites.destroy_error = None
+        await run_toolset.__aexit__(None, None, None)
+        assert run_toolset._session is None

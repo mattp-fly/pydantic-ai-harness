@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field
 from pydantic_ai import RunContext
@@ -12,12 +12,27 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
-from pydantic_ai_harness._sandbox_output import guard_read_size, render_file_window, truncate_output
+from pydantic_ai_harness._sandbox_output import render_file_window, truncate, truncate_output
 from pydantic_ai_harness.sprites._session import (
     SpriteSandboxError,
     SpriteSandboxSession,
     SpriteSandboxTerminalError,
 )
+
+
+def _strictly_bound_output(
+    text: str,
+    *,
+    max_lines: int,
+    max_bytes: int,
+    direction: Literal['head', 'tail'],
+) -> str:
+    """Apply a final marker-inclusive cap without adding more presentation text."""
+    lines = text.split('\n')
+    if len(lines) > 1 and lines[-1] == '':
+        lines = lines[:-1]
+    result = truncate(lines, max_lines=max_lines, max_bytes=max_bytes, direction=direction)
+    return '\n'.join(result.truncated_lines)
 
 
 class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
@@ -109,9 +124,14 @@ class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
     async def __aexit__(self, *args: object) -> None:
         """Close the per-run session, leaving a caller-owned session open."""
         session = self._session
-        self._session = None
-        if session is not None and self._external_session is None:
-            await session.__aexit__(*args)
+        if session is None:
+            return
+        if self._external_session is not None:
+            self._session = None
+            return
+        await session.__aexit__(*args)
+        if not session.is_open:
+            self._session = None
 
     def _require_session(self) -> SpriteSandboxSession:
         if self._session is None:
@@ -151,10 +171,15 @@ class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
             already_truncated=result.truncated,
         )
         if result.timed_out:
-            return f'{output}\n[timed out after {result.applied_timeout}s]'
-        if result.returncode:
-            return f'{output}\n[exit code: {result.returncode}]'
-        return output
+            output = f'{output}\n[timed out after {result.applied_timeout}s]'
+        elif result.returncode:
+            output = f'{output}\n[exit code: {result.returncode}]'
+        return _strictly_bound_output(
+            output,
+            max_lines=self._max_output_lines,
+            max_bytes=self._max_output_bytes,
+            direction='tail',
+        )
 
     async def read_file(
         self,
@@ -172,13 +197,11 @@ class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
         """
         session = self._require_session()
         try:
-            guard_read_size(await session.file_size(path), max_bytes=self._max_read_bytes)
-            data = await session.read_bytes(path)
+            data = await session.read_bytes(path, max_bytes=self._max_read_bytes)
         except SpriteSandboxTerminalError:
             raise
         except SpriteSandboxError as e:
-            raise ModelRetry(f'Could not read {path!r}: {e}')
-        guard_read_size(len(data), max_bytes=self._max_read_bytes)
+            raise ModelRetry(str(e))
         return render_file_window(
             data,
             offset=offset,
@@ -204,7 +227,7 @@ class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
         except SpriteSandboxTerminalError:
             raise
         except SpriteSandboxError as e:
-            raise ModelRetry(f'Could not write {path!r}: {e}')
+            raise ModelRetry(str(e))
         return f'Wrote {len(data)} bytes to {path!r}.'
 
     async def list_directory(self, path: str = '.') -> str:
@@ -215,16 +238,30 @@ class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
         """
         session = self._require_session()
         try:
-            entries = await session.list_files(path)
+            listing = await session.list_files(
+                path,
+                max_entries=self._max_output_lines,
+                max_output_bytes=self._max_output_bytes,
+            )
         except SpriteSandboxTerminalError:
             raise
         except SpriteSandboxError as e:
-            raise ModelRetry(f'Could not list {path!r}: {e}')
-        if not entries:
+            raise ModelRetry(str(e))
+        if not listing.entries and not listing.truncated:
             return '(empty)'
-        names = [f'{name}/' if is_dir else name for name, is_dir in sorted(entries)]
-        return truncate_output(
-            '\n'.join(names),
+        names = [f'{name}/' if is_dir else name for name, is_dir in sorted(listing.entries)]
+        output = '\n'.join(names)
+        if listing.truncated:
+            output = f'[... directory listing truncated ...]\n{output}'
+        else:
+            output = truncate_output(
+                output,
+                max_lines=self._max_output_lines,
+                max_bytes=self._max_output_bytes,
+                direction='head',
+            )
+        return _strictly_bound_output(
+            output,
             max_lines=self._max_output_lines,
             max_bytes=self._max_output_bytes,
             direction='head',

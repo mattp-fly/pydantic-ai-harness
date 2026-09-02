@@ -45,6 +45,9 @@ The default mode creates a uniquely named Sprite with an ownership label for
 each agent run. On exit, the session fetches the Sprite and verifies that label
 before destroying it. If the label changed, cleanup stops with
 `SpriteSandboxOwnershipError` rather than risk deleting a different Sprite.
+The label is a stale-handle guard, not an authorization boundary: the current
+Fly.io Sprites API does not support label-conditional deletion, so other actors
+with write access to the same organization must remain trusted.
 
 Attach to a Sprite you manage by name. It is left running:
 
@@ -57,17 +60,24 @@ SpriteSandbox(sprite_name='my-existing-sprite')
 To reuse one Sprite across multiple runs, own its session explicitly:
 
 ```python
+import asyncio
+
 from pydantic_ai import Agent
 from pydantic_ai_harness import SpriteSandbox
 from pydantic_ai_harness.sprites import SpriteSandboxSession
 
-async with SpriteSandboxSession() as session:
-    agent = Agent(
-        'anthropic:claude-fable-5',
-        capabilities=[SpriteSandbox(session=session)],
-    )
-    await agent.run('Install the project dependencies.')
-    await agent.run('Run the tests in the same Sprite.')
+
+async def main():
+    async with SpriteSandboxSession() as session:
+        agent = Agent(
+            'anthropic:claude-fable-5',
+            capabilities=[SpriteSandbox(session=session)],
+        )
+        await agent.run('Install the project dependencies.')
+        await agent.run('Run the tests in the same Sprite.')
+
+
+asyncio.run(main())
 ```
 
 An injected session must already be open. The capability never opens, closes,
@@ -82,14 +92,12 @@ command runs in a process group inside the Sprite, so a timeout terminates the
 shell and its child processes. The in-Sprite byte cut preserves the beginning
 and end of combined stdout and stderr before the SDK returns it. The tool layer
 then applies byte and line limits to the retained payload, keeping the tail where
-diagnostics commonly appear. Truncation markers and timeout or exit annotations
-are added after those payload limits, so the final tool result can be slightly
-larger than either configured cap.
+diagnostics commonly appear. The final command result, including truncation and
+status annotations, is clamped to both configured caps.
 
-File reads reject files larger than `max_read_bytes` before decoding them, then
-apply the output byte and line limits. Directory listings are materialized
-before truncation, so use a bounded shell command for unusually large
-directories.
+File reads reject files larger than `max_read_bytes` before decoding them and
+enforce that limit again while reading inside the Sprite. Directory listings
+apply entry and byte limits inside the Sprite before returning data to the SDK.
 
 Recoverable command and file failures become model retry prompts. A missing
 Sprite raises `SpriteSandboxUnavailableError`; rejected credentials raise

@@ -112,7 +112,7 @@ class FakeSprite:
         self.name = name
         self.labels = labels
         self.files: dict[str, bytes] = {}
-        self.directories: set[str] = {'/', '/workspace'}
+        self.directories: set[str] = {'/', '/empty', '/workspace'}
         self.run_calls: list[RunCall] = []
 
     def run(
@@ -131,7 +131,64 @@ class FakeSprite:
             raise self.control.run_error
         if argv == ('pwd',):
             return self.control.pwd_result
-        return self.control.responder(self.run_calls[-1])
+        if env is not None and 'PYDANTIC_AI_SPRITE_READ_PATH' in env:
+            return self._bounded_read(env, cwd)
+        if env is not None and 'PYDANTIC_AI_SPRITE_LIST_PATH' in env:
+            return self._bounded_list(env, cwd)
+        result = self.control.responder(self.run_calls[-1])
+        if env is not None and 'PYDANTIC_AI_SPRITE_COMMAND' in env and not result.stderr:
+            result.stderr = b'\0\0'
+        return result
+
+    def _bounded_read(self, env: dict[str, str], cwd: str | None) -> FakeExecResult:
+        self._raise_filesystem_error()
+        path = self._resolve(env['PYDANTIC_AI_SPRITE_READ_PATH'], cwd)
+        try:
+            data = self.files[path]
+        except KeyError:
+            return FakeExecResult(stderr=f'FileNotFoundError: {path}'.encode(), returncode=66)
+        limit = int(env['PYDANTIC_AI_SPRITE_READ_LIMIT'])
+        if len(data) > limit:
+            return FakeExecResult(returncode=65)
+        return FakeExecResult(stdout=data)
+
+    def _bounded_list(self, env: dict[str, str], cwd: str | None) -> FakeExecResult:
+        self._raise_filesystem_error()
+        path = self._resolve(env['PYDANTIC_AI_SPRITE_LIST_PATH'], cwd)
+        if path not in self.directories:
+            return FakeExecResult(stderr=f'FileNotFoundError: {path}'.encode(), returncode=66)
+        prefix = path.rstrip('/') + '/'
+        names: set[str] = set()
+        for candidate in [*self.files, *self.directories]:
+            if candidate.startswith(prefix):
+                remainder = candidate[len(prefix) :]
+                if remainder:
+                    names.add(remainder.split('/', 1)[0])
+        max_entries = int(env['PYDANTIC_AI_SPRITE_LIST_MAX_ENTRIES'])
+        max_bytes = int(env['PYDANTIC_AI_SPRITE_LIST_MAX_BYTES'])
+        records: list[bytes] = []
+        rendered_bytes = 0
+        truncated = False
+        for name in sorted(names):
+            entry_path = posixpath.join(path, name)
+            is_dir = entry_path in self.directories
+            encoded = name.encode()
+            rendered_cost = len(encoded) + int(is_dir) + int(bool(records))
+            if len(records) >= max_entries or rendered_bytes + rendered_cost > max_bytes:
+                truncated = True
+                break
+            records.append((b'D' if is_dir else b'F') + encoded + b'\0')
+            rendered_bytes += rendered_cost
+        return FakeExecResult(stdout=b''.join(records), stderr=b'1' if truncated else b'0')
+
+    def _resolve(self, path: str, cwd: str | None) -> str:
+        if path.startswith('/'):
+            return posixpath.normpath(path)
+        return posixpath.normpath(posixpath.join(cwd or '/workspace', path))
+
+    def _raise_filesystem_error(self) -> None:
+        if self.control.filesystem_error is not None:
+            raise self.control.filesystem_error
 
     def filesystem(self, working_dir: str = '/') -> FakeFilesystem:
         return FakeFilesystem(self, working_dir)

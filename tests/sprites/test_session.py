@@ -176,6 +176,8 @@ class TestLifecycle:
         fake_sprites.get_error = FakeSpriteError('verification failed')
         with pytest.raises(SpriteSandboxError, match='Could not verify owned Sprite'):
             await session.__aexit__(None, None, None)
+        assert session.is_open
+        assert fake_sprites.close_calls == 0
 
     async def test_client_close_error_is_reported(self, fake_sprites: FakeSprites) -> None:
         session = SpriteSandboxSession(token='token')
@@ -183,6 +185,10 @@ class TestLifecycle:
         fake_sprites.close_error = FakeSpriteError('close failed')
         with pytest.raises(FakeSpriteError, match='close failed'):
             await session.__aexit__(None, None, None)
+        assert session.is_open
+        fake_sprites.close_error = None
+        await session.__aexit__(None, None, None)
+        assert not session.is_open
 
     async def test_generic_open_failure_is_mapped(self, fake_sprites: FakeSprites) -> None:
         fake_sprites.create_error = RuntimeError('unexpected create failure')
@@ -199,7 +205,25 @@ class TestLifecycle:
         with pytest.raises(SpriteSandboxOwnershipError, match='Refusing to destroy'):
             await session.__aexit__(None, None, None)
         assert fake_sprites.destroy_calls == []
-        assert fake_sprites.close_calls == 1
+        assert fake_sprites.close_calls == 0
+        assert session.is_open
+        fake_sprites.sprites[name].labels = [fake_sprites.create_calls[-1]['labels'][-1]]
+        await session.__aexit__(None, None, None)
+        assert not session.is_open
+
+    async def test_failed_destroy_can_be_retried(self, fake_sprites: FakeSprites) -> None:
+        session = SpriteSandboxSession(token='token')
+        await session.__aenter__()
+        fake_sprites.destroy_error = FakeSpriteError('control plane unavailable')
+        with pytest.raises(SpriteSandboxError, match='Could not destroy'):
+            await session.__aexit__(None, None, None)
+        assert session.is_open
+        assert fake_sprites.close_calls == 0
+
+        fake_sprites.destroy_error = None
+        await session.__aexit__(None, None, None)
+        assert not session.is_open
+        assert len(fake_sprites.destroy_calls) == 2
 
     async def test_cleanup_error_does_not_mask_body_error(
         self, fake_sprites: FakeSprites, caplog: pytest.LogCaptureFixture
@@ -239,8 +263,9 @@ class TestOperations:
         assert result.output == 'hello\n'
         assert result.returncode == 3
         assert result.applied_timeout == 4.5
-        assert call.argv[:2] == ('bash', '-lc')
-        assert 'python3 -c' in call.argv[2]
+        assert call.argv[:4] == ('python3', '-I', '-S', '-c')
+        assert "['bash', '-c', command]" in call.argv[4]
+        assert "['bash', '-lc', command]" not in call.argv[4]
         assert call.capture_output is True
         assert call.timeout == 9.5
         assert call.cwd == '/app'
@@ -249,9 +274,8 @@ class TestOperations:
             'PYDANTIC_AI_SPRITE_TIMEOUT_SECONDS': '4.5',
         }
 
-    async def test_timeout_marker_is_removed_and_reported(self, fake_sprites: FakeSprites) -> None:
-        marker = b'\n__PYDANTIC_AI_SPRITE_TIMEOUT__\n'
-        fake_sprites.responder = lambda call: FakeExecResult(stdout=b'partial' + marker, returncode=124)
+    async def test_timeout_control_is_reported_separately_from_output(self, fake_sprites: FakeSprites) -> None:
+        fake_sprites.responder = lambda call: FakeExecResult(stdout=b'partial', stderr=b'\0\1', returncode=124)
         async with SpriteSandboxSession(token='token') as session:
             result = await session.exec('sleep 99', timeout=2, max_output_bytes=100)
         assert result.output == 'partial'
@@ -267,7 +291,7 @@ class TestOperations:
 
     async def test_truncation_marker_is_detected(self, fake_sprites: FakeSprites) -> None:
         marker = b'\n[... Sprite command output truncated ...]\n'
-        fake_sprites.responder = lambda call: FakeExecResult(stdout=b'head' + marker + b'tail')
+        fake_sprites.responder = lambda call: FakeExecResult(stdout=b'head' + marker + b'tail', stderr=b'\1\0')
         async with SpriteSandboxSession(token='token') as session:
             result = await session.exec('big', timeout=None, max_output_bytes=100)
             call = fake_sprites.sprites[session.sprite_name or ''].run_calls[-1]
@@ -275,18 +299,35 @@ class TestOperations:
         assert call.timeout is None
         assert call.env == {'PYDANTIC_AI_SPRITE_COMMAND': 'big'}
 
+    async def test_timeout_text_in_command_output_is_not_a_status_signal(self, fake_sprites: FakeSprites) -> None:
+        marker = b'\n__PYDANTIC_AI_SPRITE_TIMEOUT__\n'
+        fake_sprites.responder = lambda call: FakeExecResult(stdout=marker, stderr=b'\0\0')
+        async with SpriteSandboxSession(token='token') as session:
+            result = await session.exec('printf marker', timeout=2, max_output_bytes=100)
+        assert result.output == marker.decode()
+        assert result.timed_out is False
+
+    async def test_decoding_replacement_cannot_expand_past_byte_limit(self, fake_sprites: FakeSprites) -> None:
+        fake_sprites.responder = lambda call: FakeExecResult(stdout=b'\xff', stderr=b'\0\0')
+        async with SpriteSandboxSession(token='token') as session:
+            result = await session.exec('printf invalid', timeout=2, max_output_bytes=1)
+        assert len(result.output.encode()) <= 1
+        assert result.truncated is True
+
     async def test_file_roundtrip_and_listing(self, fake_sprites: FakeSprites) -> None:
         async with SpriteSandboxSession(token='token') as session:
             await session.write_bytes('sub/file.txt', b'hello')
             assert await session.file_size('sub/file.txt') == 5
-            assert await session.read_bytes('sub/file.txt') == b'hello'
-            assert sorted(await session.list_files('.')) == [('sub', True)]
+            assert await session.read_bytes('sub/file.txt', max_bytes=5) == b'hello'
+            listing = await session.list_files('.', max_entries=10, max_output_bytes=100)
+            assert listing.entries == [('sub', True)]
+            assert listing.truncated is False
 
     async def test_transient_sdk_failure_is_recoverable(self, fake_sprites: FakeSprites) -> None:
         async with SpriteSandboxSession(token='token') as session:
             fake_sprites.filesystem_error = FakeSpriteError('temporary failure')
             with pytest.raises(SpriteSandboxError, match='temporary failure') as exc_info:
-                await session.read_bytes('x')
+                await session.read_bytes('x', max_bytes=10)
         assert not isinstance(exc_info.value, SpriteSandboxUnavailableError)
 
     async def test_operation_detects_destroyed_sprite(self, fake_sprites: FakeSprites) -> None:
@@ -295,7 +336,7 @@ class TestOperations:
             fake_sprites.filesystem_error = FakeSpriteError('request failed')
             fake_sprites.get_error = FakeNotFoundError('gone')
             with pytest.raises(SpriteSandboxUnavailableError, match='no longer exists'):
-                await session.read_bytes('x')
+                await session.read_bytes('x', max_bytes=10)
 
     async def test_operation_detects_expired_auth(self, fake_sprites: FakeSprites) -> None:
         fake_sprites.add_sprite('kept')
@@ -303,7 +344,7 @@ class TestOperations:
             fake_sprites.filesystem_error = FakeSpriteError('request failed')
             fake_sprites.get_error = FakeAuthenticationError('expired')
             with pytest.raises(SpriteSandboxAuthError, match='rejected the credentials'):
-                await session.read_bytes('x')
+                await session.read_bytes('x', max_bytes=10)
 
     @pytest.mark.parametrize(
         ('error', 'expected'),
@@ -318,13 +359,13 @@ class TestOperations:
         async with SpriteSandboxSession(token='token') as session:
             fake_sprites.filesystem_error = error
             with pytest.raises(expected):
-                await session.read_bytes('x')
+                await session.read_bytes('x', max_bytes=10)
 
     async def test_non_sdk_operation_error_is_recoverable(self, fake_sprites: FakeSprites) -> None:
         async with SpriteSandboxSession(token='token') as session:
             fake_sprites.filesystem_error = RuntimeError('unexpected')
             with pytest.raises(SpriteSandboxError, match='unexpected'):
-                await session.read_bytes('x')
+                await session.read_bytes('x', max_bytes=10)
 
     async def test_probe_failure_preserves_original_operation_error(self, fake_sprites: FakeSprites) -> None:
         session = SpriteSandboxSession(token='token')
@@ -333,11 +374,11 @@ class TestOperations:
             fake_sprites.filesystem_error = FakeSpriteError('disk issue')
             fake_sprites.get_error = FakeSpriteError('probe issue')
             with pytest.raises(SpriteSandboxError, match='disk issue'):
-                await session.read_bytes('x')
+                await session.read_bytes('x', max_bytes=10)
         finally:
             fake_sprites.get_error = None
             await session.__aexit__(None, None, None)
 
     async def test_unopened_operations_raise(self) -> None:
         with pytest.raises(SpriteSandboxError, match='not open'):
-            await SpriteSandboxSession(token='token').read_bytes('x')
+            await SpriteSandboxSession(token='token').read_bytes('x', max_bytes=10)

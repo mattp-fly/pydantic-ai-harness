@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-import shlex
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -37,10 +36,16 @@ DEFAULT_MAX_COMMAND_TIMEOUT = 300.0
 _PROVIDER_LABEL = 'pydantic-ai-harness'
 _COMMAND_ENV = 'PYDANTIC_AI_SPRITE_COMMAND'
 _COMMAND_TIMEOUT_ENV = 'PYDANTIC_AI_SPRITE_TIMEOUT_SECONDS'
+_READ_PATH_ENV = 'PYDANTIC_AI_SPRITE_READ_PATH'
+_READ_LIMIT_ENV = 'PYDANTIC_AI_SPRITE_READ_LIMIT'
+_LIST_PATH_ENV = 'PYDANTIC_AI_SPRITE_LIST_PATH'
+_LIST_MAX_ENTRIES_ENV = 'PYDANTIC_AI_SPRITE_LIST_MAX_ENTRIES'
+_LIST_MAX_BYTES_ENV = 'PYDANTIC_AI_SPRITE_LIST_MAX_BYTES'
 _TRUNCATION_MARKER = b'\n[... Sprite command output truncated ...]\n'
-_TIMEOUT_MARKER = b'\n__PYDANTIC_AI_SPRITE_TIMEOUT__\n'
 _TRANSPORT_TIMEOUT_GRACE = 5.0
 _PWD_TIMEOUT = 10.0
+_HELPER_ERROR_EXIT = 66
+_READ_LIMIT_EXIT = 65
 
 _MISSING_SPRITES = (
     'The \'sprites-py\' package is required for SpriteSandbox. Install it with `uv add "pydantic-ai-harness[sprites]"`.'
@@ -91,10 +96,17 @@ class SpriteSandboxExecResult:
     """The command deadline enforced inside the Sprite, if any."""
 
 
+@dataclass(frozen=True, kw_only=True)
+class _SpriteSandboxListResult:
+    entries: list[tuple[str, bool]]
+    truncated: bool
+
+
 def _execute_wrapper(max_output_bytes: int) -> str:
     """Build an in-Sprite process-group runner with bounded combined output."""
-    content_budget = max(0, max_output_bytes - len(_TRUNCATION_MARKER))
-    script = f"""
+    truncation_marker = _TRUNCATION_MARKER[:max_output_bytes]
+    content_budget = max_output_bytes - len(truncation_marker)
+    return f"""
 import os
 import signal
 import subprocess
@@ -104,8 +116,7 @@ import threading
 budget = {content_budget}
 head_budget = budget // 2
 tail_budget = budget - head_budget
-truncation_marker = {_TRUNCATION_MARKER!r}
-timeout_marker = {_TIMEOUT_MARKER!r}
+truncation_marker = {truncation_marker!r}
 command = os.environ[{_COMMAND_ENV!r}]
 raw_timeout = os.environ.get({_COMMAND_TIMEOUT_ENV!r})
 command_timeout = float(raw_timeout) if raw_timeout else None
@@ -114,7 +125,7 @@ tail = bytearray()
 total = 0
 
 process = subprocess.Popen(
-    ['bash', '-lc', command],
+    ['bash', '-c', command],
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     start_new_session=True,
@@ -165,20 +176,68 @@ if reader.is_alive():
     process.stdout.close()
     reader.join(timeout=1.0)
 
-if total > budget:
+truncated = total > budget
+if truncated:
     output = bytes(head) + truncation_marker + bytes(tail)
 else:
     output = bytes(head) + bytes(tail)
 sys.stdout.buffer.write(output)
 if timed_out:
-    sys.stdout.buffer.write(timeout_marker)
     returncode = 124
 elif returncode < 0:
     returncode = 128 - returncode
 sys.stdout.buffer.flush()
+sys.stderr.buffer.write(bytes((int(truncated), int(timed_out))))
+sys.stderr.buffer.flush()
 raise SystemExit(returncode)
 """.strip()
-    return f'python3 -c {shlex.quote(script)} 2>&1'
+
+
+_BOUNDED_READ_SCRIPT = f"""
+import os
+import sys
+
+path = os.environ[{_READ_PATH_ENV!r}]
+limit = int(os.environ[{_READ_LIMIT_ENV!r}])
+try:
+    with open(path, 'rb') as file:
+        data = file.read(limit + 1)
+except BaseException as error:
+    sys.stderr.write(f'{{type(error).__name__}}: {{error}}')
+    raise SystemExit({_HELPER_ERROR_EXIT})
+if len(data) > limit:
+    raise SystemExit({_READ_LIMIT_EXIT})
+sys.stdout.buffer.write(data)
+""".strip()
+
+
+_BOUNDED_LIST_SCRIPT = f"""
+import os
+import sys
+
+path = os.environ[{_LIST_PATH_ENV!r}]
+max_entries = int(os.environ[{_LIST_MAX_ENTRIES_ENV!r}])
+max_bytes = int(os.environ[{_LIST_MAX_BYTES_ENV!r}])
+count = 0
+rendered_bytes = 0
+truncated = False
+try:
+    with os.scandir(path) as entries:
+        for entry in entries:
+            is_dir = entry.is_dir(follow_symlinks=False)
+            name = entry.name.encode('utf-8', errors='replace')
+            rendered_cost = len(name) + int(is_dir) + int(count > 0)
+            if count >= max_entries or rendered_bytes + rendered_cost > max_bytes:
+                truncated = True
+                break
+            sys.stdout.buffer.write((b'D' if is_dir else b'F') + name + b'\\0')
+            rendered_bytes += rendered_cost
+            count += 1
+except BaseException as error:
+    sys.stderr.write(f'{{type(error).__name__}}: {{error}}')
+    raise SystemExit({_HELPER_ERROR_EXIT})
+sys.stderr.buffer.write(b'1' if truncated else b'0')
+""".strip()
 
 
 class SpriteSandboxSession:
@@ -330,14 +389,14 @@ class SpriteSandboxSession:
                 await self._destroy_owned(client, sprite.name, self._ownership_label)
         except BaseException as e:
             cleanup_error = e
-        finally:
+        if cleanup_error is None:
             try:
                 await _run_sync(client.close)
             except BaseException as e:
-                cleanup_error = cleanup_error or e
-            self._client = None
+                cleanup_error = e
 
         if cleanup_error is None:
+            self._client = None
             self._sprite = None
             self._cwd = None
             self._ownership_label = None
@@ -373,6 +432,10 @@ class SpriteSandboxSession:
                 f'Refusing to destroy Sprite {sprite_name!r}: its ownership label changed. '
                 'Delete it manually after verifying ownership.'
             )
+        # The API currently exposes name-based deletion without an ownership-label
+        # precondition. The random name and label protect against stale handles and
+        # accidental reuse; actors with write access to the same organization remain
+        # inside the trust boundary and could race this check.
         try:
             await _run_sync(lambda: client.destroy_sprite(sprite_name))
         except NotFoundError:
@@ -440,8 +503,10 @@ class SpriteSandboxSession:
         try:
             result = await _run_sync(
                 lambda: sprite.run(
-                    'bash',
-                    '-lc',
+                    'python3',
+                    '-I',
+                    '-S',
+                    '-c',
                     _execute_wrapper(max_output_bytes),
                     capture_output=True,
                     timeout=transport_timeout,
@@ -454,15 +519,24 @@ class SpriteSandboxSession:
                 return SpriteSandboxExecResult(output='', returncode=124, timed_out=True, applied_timeout=timeout)
             raise await self._operation_error(e, 'Command could not run in the Sprite') from e
 
-        raw = (result.stdout or b'') + (result.stderr or b'')
-        timed_out = raw.endswith(_TIMEOUT_MARKER)
-        if timed_out:
-            raw = raw[: -len(_TIMEOUT_MARKER)]
+        control = result.stderr or b''
+        if len(control) != 2 or control[0] not in (0, 1) or control[1] not in (0, 1):
+            detail = control.decode('utf-8', errors='replace').strip()
+            suffix = f': {detail}' if detail else ''
+            raise SpriteSandboxError(f'Command wrapper did not return valid status{suffix}')
+        raw = result.stdout or b''
+        if len(raw) > max_output_bytes:
+            raise SpriteSandboxError('Command wrapper returned more output than its configured byte limit.')
+        output = raw.decode('utf-8', errors='replace')
+        encoded_output = output.encode('utf-8')
+        decoding_truncated = len(encoded_output) > max_output_bytes
+        if decoding_truncated:
+            output = encoded_output[:max_output_bytes].decode('utf-8', errors='ignore')
         return SpriteSandboxExecResult(
-            output=raw.decode('utf-8', errors='replace'),
+            output=output,
             returncode=result.returncode,
-            truncated=_TRUNCATION_MARKER in raw,
-            timed_out=timed_out,
+            truncated=bool(control[0]) or decoding_truncated,
+            timed_out=bool(control[1]),
             applied_timeout=timeout,
         )
 
@@ -474,13 +548,37 @@ class SpriteSandboxSession:
         except Exception as e:
             raise await self._operation_error(e, f'Could not stat {path!r}') from e
 
-    async def read_bytes(self, path: str) -> bytes:
-        """Read a file as bytes."""
+    async def read_bytes(self, path: str, *, max_bytes: int) -> bytes:
+        """Read at most `max_bytes` from a file without buffering a larger response."""
         _, sprite, cwd = self._require_open()
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError(f'max_bytes must be a positive integer, got {max_bytes!r}.')
         try:
-            return await _run_sync(lambda: (sprite.filesystem(cwd) / path).read_bytes())
+            result = await _run_sync(
+                lambda: sprite.run(
+                    'python3',
+                    '-I',
+                    '-S',
+                    '-c',
+                    _BOUNDED_READ_SCRIPT,
+                    capture_output=True,
+                    timeout=self._api_timeout,
+                    env={_READ_PATH_ENV: path, _READ_LIMIT_ENV: str(max_bytes)},
+                    cwd=cwd,
+                )
+            )
         except Exception as e:
             raise await self._operation_error(e, f'Could not read {path!r}') from e
+        if result.returncode == _READ_LIMIT_EXIT:
+            raise SpriteSandboxError(f'File {path!r} exceeded the {max_bytes}-byte read limit while it was being read.')
+        if result.returncode != 0:
+            detail = (result.stderr or b'').decode('utf-8', errors='replace').strip()
+            suffix = f': {detail}' if detail else ''
+            raise SpriteSandboxError(f'Could not read {path!r}{suffix}')
+        data = result.stdout or b''
+        if len(data) > max_bytes:
+            raise SpriteSandboxError(f'File response exceeded the {max_bytes}-byte read limit.')
+        return data
 
     async def write_bytes(self, path: str, data: bytes) -> None:
         """Write bytes to a file, creating parent directories."""
@@ -490,18 +588,60 @@ class SpriteSandboxSession:
         except Exception as e:
             raise await self._operation_error(e, f'Could not write {path!r}') from e
 
-    async def list_files(self, path: str) -> list[tuple[str, bool]]:
-        """List a directory as `(name, is_dir)` pairs."""
+    async def list_files(
+        self,
+        path: str,
+        *,
+        max_entries: int,
+        max_output_bytes: int,
+    ) -> _SpriteSandboxListResult:
+        """List a bounded prefix of a directory without buffering an unbounded API response."""
         _, sprite, cwd = self._require_open()
-
-        def list_sync() -> list[tuple[str, bool]]:
-            entries = (sprite.filesystem(cwd) / path).iterdir()
-            return [(entry.name, entry.stat().is_dir) for entry in entries]
-
+        if type(max_entries) is not int or max_entries <= 0:
+            raise ValueError(f'max_entries must be a positive integer, got {max_entries!r}.')
+        if type(max_output_bytes) is not int or max_output_bytes <= 0:
+            raise ValueError(f'max_output_bytes must be a positive integer, got {max_output_bytes!r}.')
         try:
-            return await _run_sync(list_sync)
+            result = await _run_sync(
+                lambda: sprite.run(
+                    'python3',
+                    '-I',
+                    '-S',
+                    '-c',
+                    _BOUNDED_LIST_SCRIPT,
+                    capture_output=True,
+                    timeout=self._api_timeout,
+                    env={
+                        _LIST_PATH_ENV: path,
+                        _LIST_MAX_ENTRIES_ENV: str(max_entries),
+                        _LIST_MAX_BYTES_ENV: str(max_output_bytes),
+                    },
+                    cwd=cwd,
+                )
+            )
         except Exception as e:
             raise await self._operation_error(e, f'Could not list {path!r}') from e
+        if result.returncode != 0:
+            detail = (result.stderr or b'').decode('utf-8', errors='replace').strip()
+            suffix = f': {detail}' if detail else ''
+            raise SpriteSandboxError(f'Could not list {path!r}{suffix}')
+        control = result.stderr or b''
+        if control not in (b'0', b'1'):
+            raise SpriteSandboxError('Directory helper did not return valid status.')
+        raw = result.stdout or b''
+        if len(raw) > max_output_bytes + max_entries + 1:
+            raise SpriteSandboxError('Directory helper returned more data than its configured limit.')
+        records = raw.split(b'\0')
+        if records[-1] != b'':
+            raise SpriteSandboxError('Directory helper returned an incomplete entry.')
+        entries: list[tuple[str, bool]] = []
+        for record in records[:-1]:
+            if not record or record[:1] not in (b'D', b'F'):
+                raise SpriteSandboxError('Directory helper returned an invalid entry.')
+            entries.append((record[1:].decode('utf-8', errors='replace'), record[:1] == b'D'))
+        if len(entries) > max_entries:
+            raise SpriteSandboxError('Directory helper returned too many entries.')
+        return _SpriteSandboxListResult(entries=entries, truncated=control == b'1')
 
 
 def _is_positive_finite(value: float) -> bool:
