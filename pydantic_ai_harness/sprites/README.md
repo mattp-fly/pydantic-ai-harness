@@ -1,15 +1,16 @@
-# Sprite Sandbox
+# Fly.io Sprites Sandbox
 
-`SpriteSandbox` gives a Pydantic AI agent a persistent Linux computer for
-running commands and working with files. By default, every agent run creates a
-fresh Sprite and destroys it at the end. You can instead attach to an existing
-Sprite or reuse a caller-owned session across runs.
+`SpriteSandbox` gives a Pydantic AI agent a persistent
+[Fly.io Sprite](https://docs.sprites.dev/): a Linux cloud computer for running
+commands and working with files. By default, every agent run creates a fresh
+Sprite and destroys it at the end. You can instead attach to an existing Sprite
+or reuse a caller-owned session across runs.
 
 > While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
 
 ## Quick start
 
-Install the optional dependency and provide a Sprites API token:
+Install the optional dependency and provide a Fly.io Sprites API token:
 
 ```bash
 uv add "pydantic-ai-harness[sprites]"
@@ -95,7 +96,7 @@ Sprite raises `SpriteSandboxUnavailableError`; rejected credentials raise
 `SpriteSandboxAuthError`. Both are terminal because retrying the same tool call
 cannot repair them.
 
-The Sprites Python SDK is synchronous. This integration runs SDK calls in worker
+The Fly.io Sprites Python SDK is synchronous. This integration runs SDK calls in worker
 threads so it does not block the agent event loop.
 
 ## Configuration
@@ -129,7 +130,7 @@ the same tool names. Use Pydantic AI's `PrefixTools` when an agent needs both.
 
 ## Further reading
 
-- [Sprites documentation](https://docs.sprites.dev/)
-- [Sprites Python SDK](https://github.com/superfly/sprites-py)
+- [Fly.io Sprites documentation](https://docs.sprites.dev/)
+- [Fly.io Sprites Python SDK](https://github.com/superfly/sprites-py)
 - [Pydantic AI capabilities](https://pydantic.dev/docs/ai/capabilities/overview/)
-- [Sprite Sandbox source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/sprites/)
+- [Fly.io Sprites Sandbox source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/sprites/)

@@ -1,23 +1,22 @@
 ---
-title: Sprite Sandbox
-description: Give a Pydantic AI agent a persistent Sprite with command and file tools.
+title: Fly.io Sprites Sandbox
+description: Give a Pydantic AI agent a persistent Fly.io Sprite with command and file tools.
 ---
 
-# Sprite Sandbox
+# Fly.io Sprites Sandbox
 
-`SpriteSandbox` gives an agent a persistent Linux computer for running commands
-and working with files. Use it for coding, data processing, and long-running
-tasks that should not execute model-generated commands on the application host.
-
-The capability is backed by [Sprites](https://docs.sprites.dev/). By default,
-each agent run gets a fresh Sprite that is destroyed when the run ends. You can
-also attach to an existing Sprite or reuse one across several runs.
+`SpriteSandbox` gives an agent a persistent [Fly.io Sprite](https://docs.sprites.dev/):
+a Linux cloud computer for running commands and working with files. Use it for
+coding, data processing, and long-running tasks that should not execute
+model-generated commands on the application host. By default, each agent run
+gets a fresh Sprite that is destroyed when the run ends. You can also attach to
+an existing Sprite or reuse one across several runs.
 
 > While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
 
 ## Quick start
 
-Install the `sprites` extra and set a Sprites API token:
+Install the `sprites` extra and set a Fly.io Sprites API token:
 
 ```bash
 uv add "pydantic-ai-harness[sprites]"
@@ -101,7 +100,7 @@ again. A file that grows between those operations can temporarily exceed
 materializes the complete listing before truncation. Use bounded shell commands
 for virtual files or unusually large directories.
 
-The Sprites Python SDK is synchronous. The capability runs its calls in worker
+The Fly.io Sprites Python SDK is synchronous. The capability runs its calls in worker
 threads, so SDK requests do not block the agent event loop.
 
 ## Errors and composition
@@ -144,10 +143,10 @@ them.
 
 ## API reference
 
-- [Sprites documentation](https://docs.sprites.dev/)
-- [Sprites Python SDK](https://github.com/superfly/sprites-py)
+- [Fly.io Sprites documentation](https://docs.sprites.dev/)
+- [Fly.io Sprites Python SDK](https://github.com/superfly/sprites-py)
 - [Pydantic AI capabilities](/ai/capabilities/overview/)
-- [Sprite Sandbox source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/sprites/)
+- [Fly.io Sprites Sandbox source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/sprites/)
 
 ::: pydantic_ai_harness.sprites.SpriteSandbox
 

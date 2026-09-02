@@ -45,7 +45,7 @@ _PWD_TIMEOUT = 10.0
 _MISSING_SPRITES = (
     'The \'sprites-py\' package is required for SpriteSandbox. Install it with `uv add "pydantic-ai-harness[sprites]"`.'
 )
-_AUTH_MESSAGE = 'Sprites rejected the credentials. Set SPRITE_TOKEN or pass `token=`.'
+_AUTH_MESSAGE = 'Fly.io Sprites rejected the credentials. Set SPRITE_TOKEN or pass `token=`.'
 
 T = TypeVar('T')
 
@@ -56,7 +56,7 @@ async def _run_sync(func: Callable[[], T]) -> T:
 
 
 class SpriteSandboxError(RuntimeError):
-    """Base class for failures reported by the Sprites integration."""
+    """Base class for failures reported by the Fly.io Sprites integration."""
 
 
 class SpriteSandboxTerminalError(SpriteSandboxError):
@@ -68,7 +68,7 @@ class SpriteSandboxUnavailableError(SpriteSandboxTerminalError):
 
 
 class SpriteSandboxAuthError(SpriteSandboxTerminalError):
-    """The Sprites API rejected the configured token."""
+    """The Fly.io Sprites API rejected the configured token."""
 
 
 class SpriteSandboxOwnershipError(SpriteSandboxTerminalError):
@@ -190,9 +190,9 @@ class SpriteSandboxSession:
     leaves it running on exit.
 
     Args:
-        token: Sprites API token. Defaults to `SPRITE_TOKEN` on entry.
+        token: Fly.io Sprites API token. Defaults to `SPRITE_TOKEN` on entry.
         sprite_name: Existing Sprite to attach to. Omit to create an owned Sprite.
-        base_url: Sprites API base URL.
+        base_url: Fly.io Sprites API base URL.
         api_timeout: Timeout in seconds for API calls other than Sprite creation.
         runtime: Runtime channel for an owned Sprite: `default`, `dev`, or None.
         workdir: Working directory for commands and relative file paths. When

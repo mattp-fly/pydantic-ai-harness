@@ -1,4 +1,4 @@
-"""Sprites sandbox capability for Pydantic AI agents.
+"""Fly.io Sprites sandbox capability for Pydantic AI agents.
 
 `SpriteSandbox` is the supported entry point. `SpriteSandboxSession` exposes
 lower-level lifecycle, command, and file access for applications that need to

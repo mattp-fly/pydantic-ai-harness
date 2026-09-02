@@ -1,4 +1,4 @@
-"""Sprites capability that gives agents a persistent cloud computer."""
+"""Fly.io Sprites capability that gives agents a persistent cloud computer."""
 
 from __future__ import annotations
 
@@ -25,14 +25,14 @@ from pydantic_ai_harness.sprites._toolset import SpriteSandboxToolset
 _DEFAULT_MAX_READ_BYTES = 5 * 1024 * 1024
 
 _OWNED_INSTRUCTIONS = (
-    'You have a Sprite: an isolated, persistent Linux computer created for this run. Use `run_command` '
+    'You have a Fly.io Sprite: an isolated, persistent Linux computer created for this run. Use `run_command` '
     'to run shell commands, and `read_file` / `write_file` / `list_directory` to manage files. Commands '
     'run through Bash, so pipes and redirection work. A command times out after {default_timeout}s unless '
     'you pass `timeout_seconds` (up to {max_timeout}s). This Sprite is destroyed when the run ends.'
 )
 
 _REUSED_INSTRUCTIONS = (
-    'You have a Sprite: an isolated, persistent Linux computer. Use `run_command` to run shell commands, '
+    'You have a Fly.io Sprite: an isolated, persistent Linux computer. Use `run_command` to run shell commands, '
     'and `read_file` / `write_file` / `list_directory` to manage files. Commands run through Bash, so pipes '
     'and redirection work. A command times out after {default_timeout}s unless you pass `timeout_seconds` '
     '(up to {max_timeout}s). This Sprite is reused across runs, so earlier files can still be present.'
@@ -41,7 +41,7 @@ _REUSED_INSTRUCTIONS = (
 
 @dataclass(kw_only=True)
 class SpriteSandbox(AbstractCapability[AgentDepsT]):
-    """Access to a persistent cloud computer powered by [Sprites](https://sprites.dev).
+    """Access to a persistent cloud computer powered by [Fly.io Sprites](https://sprites.dev).
 
     By default, each agent run creates a fresh Sprite and destroys it when the run
     ends. Set `sprite_name` to attach to a Sprite you manage, or pass an already-open
@@ -49,7 +49,7 @@ class SpriteSandbox(AbstractCapability[AgentDepsT]):
     left running.
 
     Requires the `sprites` extra (`uv add "pydantic-ai-harness[sprites]"`) and a
-    Sprites API token in `SPRITE_TOKEN`, or passed via `token`.
+    Fly.io Sprites API token in `SPRITE_TOKEN`, or passed via `token`.
 
     ```python
     from pydantic_ai import Agent
@@ -62,7 +62,7 @@ class SpriteSandbox(AbstractCapability[AgentDepsT]):
     """
 
     token: str | None = None
-    """Sprites API token. When omitted, `SPRITE_TOKEN` is read when a run starts."""
+    """Fly.io Sprites API token. When omitted, `SPRITE_TOKEN` is read when a run starts."""
 
     sprite_name: str | None = None
     """Attach to an existing Sprite by name instead of creating one per run.
@@ -79,10 +79,10 @@ class SpriteSandbox(AbstractCapability[AgentDepsT]):
     """
 
     base_url: str = _DEFAULT_BASE_URL
-    """Sprites API base URL."""
+    """Fly.io Sprites API base URL."""
 
     api_timeout: float = _DEFAULT_API_TIMEOUT
-    """Timeout in seconds for Sprites API operations, excluding Sprite creation."""
+    """Timeout in seconds for Fly.io Sprites API operations, excluding Sprite creation."""
 
     runtime: str | None = None
     """Runtime channel for a newly created Sprite: `default`, `dev`, or None."""

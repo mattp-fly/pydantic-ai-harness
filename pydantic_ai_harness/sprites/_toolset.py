@@ -1,4 +1,4 @@
-"""Sprites toolset: gives agents a persistent cloud computer to work in."""
+"""Fly.io Sprites toolset: gives agents a persistent cloud computer to work in."""
 
 from __future__ import annotations
 
