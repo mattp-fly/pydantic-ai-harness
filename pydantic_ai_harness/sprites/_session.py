@@ -44,6 +44,7 @@ _LIST_MAX_BYTES_ENV = 'PYDANTIC_AI_SPRITE_LIST_MAX_BYTES'
 _TRUNCATION_MARKER = b'\n[... Sprite command output truncated ...]\n'
 _TRANSPORT_TIMEOUT_GRACE = 5.0
 _PWD_TIMEOUT = 10.0
+_STATUS_OUTPUT_LIMIT = 4096
 _HELPER_ERROR_EXIT = 66
 _READ_LIMIT_EXIT = 65
 
@@ -100,6 +101,39 @@ class SpriteSandboxExecResult:
 class _SpriteSandboxListResult:
     entries: list[tuple[str, bool]]
     truncated: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class _BoundedCommandResult:
+    stdout: bytes
+    stderr: bytes
+    returncode: int
+
+
+class _ResponseLimitExceeded(RuntimeError):
+    pass
+
+
+class _BoundedSink:
+    """A file-like SDK sink that aborts a response as soon as its cap is crossed."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._data = bytearray()
+        self.exceeded = False
+
+    @property
+    def data(self) -> bytes:
+        return bytes(self._data)
+
+    def write(self, data: bytes) -> int:
+        remaining = self._limit - len(self._data)
+        if len(data) > remaining:
+            self._data.extend(data[:remaining])
+            self.exceeded = True
+            raise _ResponseLimitExceeded(f'Sprite response exceeded its {self._limit}-byte transport limit.')
+        self._data.extend(data)
+        return len(data)
 
 
 def _execute_wrapper(max_output_bytes: int) -> str:
@@ -220,6 +254,7 @@ max_entries = int(os.environ[{_LIST_MAX_ENTRIES_ENV!r}])
 max_bytes = int(os.environ[{_LIST_MAX_BYTES_ENV!r}])
 count = 0
 rendered_bytes = 0
+wire_bytes = 0
 truncated = False
 try:
     with os.scandir(path) as entries:
@@ -227,11 +262,17 @@ try:
             is_dir = entry.is_dir(follow_symlinks=False)
             name = entry.name.encode('utf-8', errors='replace')
             rendered_cost = len(name) + int(is_dir) + int(count > 0)
-            if count >= max_entries or rendered_bytes + rendered_cost > max_bytes:
+            wire_cost = len(name) + 2
+            if (
+                count >= max_entries
+                or rendered_bytes + rendered_cost > max_bytes
+                or wire_bytes + wire_cost > max_bytes
+            ):
                 truncated = True
                 break
             sys.stdout.buffer.write((b'D' if is_dir else b'F') + name + b'\\0')
             rendered_bytes += rendered_cost
+            wire_bytes += wire_cost
             count += 1
 except BaseException as error:
     sys.stderr.write(f'{{type(error).__name__}}: {{error}}')
@@ -412,8 +453,51 @@ class SpriteSandboxSession:
             return
         raise cleanup_error
 
+    async def _run_bounded_command(
+        self,
+        sprite: Sprite,
+        *args: str,
+        stdout_limit: int,
+        stderr_limit: int = _STATUS_OUTPUT_LIMIT,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> _BoundedCommandResult:
+        """Run through SDK streaming sinks so a replaced helper cannot return unbounded data."""
+
+        def run() -> _BoundedCommandResult:
+            from sprites.exceptions import ExitError
+
+            stdout = _BoundedSink(stdout_limit)
+            stderr = _BoundedSink(stderr_limit)
+            command = sprite.command(
+                *args,
+                stdout=stdout,
+                stderr=stderr,
+                timeout=timeout,
+                env=env,
+                cwd=cwd,
+            )
+            returncode = 0
+            try:
+                command.run()
+            except ExitError as e:
+                returncode = e.exit_code()
+            except Exception as e:
+                if stdout.exceeded or stderr.exceeded:
+                    raise _ResponseLimitExceeded('Sprite response exceeded its configured transport limit.') from e
+                raise
+            return _BoundedCommandResult(stdout=stdout.data, stderr=stderr.data, returncode=returncode)
+
+        return await _run_sync(run)
+
     async def _read_cwd(self, sprite: Sprite) -> str:
-        result = await _run_sync(lambda: sprite.run('pwd', capture_output=True, timeout=_PWD_TIMEOUT))
+        result = await self._run_bounded_command(
+            sprite,
+            'pwd',
+            stdout_limit=_STATUS_OUTPUT_LIMIT,
+            timeout=_PWD_TIMEOUT,
+        )
         if result.returncode != 0 or not result.stdout:
             raise SpriteSandboxError(f'Could not determine the Sprite working directory (exit {result.returncode}).')
         return result.stdout.decode('utf-8', errors='replace').strip()
@@ -501,18 +585,17 @@ class SpriteSandboxSession:
             environment[_COMMAND_TIMEOUT_ENV] = str(timeout)
             transport_timeout = timeout + _TRANSPORT_TIMEOUT_GRACE
         try:
-            result = await _run_sync(
-                lambda: sprite.run(
-                    'python3',
-                    '-I',
-                    '-S',
-                    '-c',
-                    _execute_wrapper(max_output_bytes),
-                    capture_output=True,
-                    timeout=transport_timeout,
-                    env=environment,
-                    cwd=cwd,
-                )
+            result = await self._run_bounded_command(
+                sprite,
+                'python3',
+                '-I',
+                '-S',
+                '-c',
+                _execute_wrapper(max_output_bytes),
+                stdout_limit=max_output_bytes,
+                timeout=transport_timeout,
+                env=environment,
+                cwd=cwd,
             )
         except Exception as e:
             if isinstance(e, SpriteTimeoutError):
@@ -540,32 +623,23 @@ class SpriteSandboxSession:
             applied_timeout=timeout,
         )
 
-    async def file_size(self, path: str) -> int:
-        """Return a file size without reading the file."""
-        _, sprite, cwd = self._require_open()
-        try:
-            return await _run_sync(lambda: (sprite.filesystem(cwd) / path).stat().size)
-        except Exception as e:
-            raise await self._operation_error(e, f'Could not stat {path!r}') from e
-
     async def read_bytes(self, path: str, *, max_bytes: int) -> bytes:
         """Read at most `max_bytes` from a file without buffering a larger response."""
         _, sprite, cwd = self._require_open()
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError(f'max_bytes must be a positive integer, got {max_bytes!r}.')
         try:
-            result = await _run_sync(
-                lambda: sprite.run(
-                    'python3',
-                    '-I',
-                    '-S',
-                    '-c',
-                    _BOUNDED_READ_SCRIPT,
-                    capture_output=True,
-                    timeout=self._api_timeout,
-                    env={_READ_PATH_ENV: path, _READ_LIMIT_ENV: str(max_bytes)},
-                    cwd=cwd,
-                )
+            result = await self._run_bounded_command(
+                sprite,
+                'python3',
+                '-I',
+                '-S',
+                '-c',
+                _BOUNDED_READ_SCRIPT,
+                stdout_limit=max_bytes,
+                timeout=self._api_timeout,
+                env={_READ_PATH_ENV: path, _READ_LIMIT_ENV: str(max_bytes)},
+                cwd=cwd,
             )
         except Exception as e:
             raise await self._operation_error(e, f'Could not read {path!r}') from e
@@ -602,22 +676,21 @@ class SpriteSandboxSession:
         if type(max_output_bytes) is not int or max_output_bytes <= 0:
             raise ValueError(f'max_output_bytes must be a positive integer, got {max_output_bytes!r}.')
         try:
-            result = await _run_sync(
-                lambda: sprite.run(
-                    'python3',
-                    '-I',
-                    '-S',
-                    '-c',
-                    _BOUNDED_LIST_SCRIPT,
-                    capture_output=True,
-                    timeout=self._api_timeout,
-                    env={
-                        _LIST_PATH_ENV: path,
-                        _LIST_MAX_ENTRIES_ENV: str(max_entries),
-                        _LIST_MAX_BYTES_ENV: str(max_output_bytes),
-                    },
-                    cwd=cwd,
-                )
+            result = await self._run_bounded_command(
+                sprite,
+                'python3',
+                '-I',
+                '-S',
+                '-c',
+                _BOUNDED_LIST_SCRIPT,
+                stdout_limit=max_output_bytes,
+                timeout=self._api_timeout,
+                env={
+                    _LIST_PATH_ENV: path,
+                    _LIST_MAX_ENTRIES_ENV: str(max_entries),
+                    _LIST_MAX_BYTES_ENV: str(max_output_bytes),
+                },
+                cwd=cwd,
             )
         except Exception as e:
             raise await self._operation_error(e, f'Could not list {path!r}') from e
@@ -629,7 +702,7 @@ class SpriteSandboxSession:
         if control not in (b'0', b'1'):
             raise SpriteSandboxError('Directory helper did not return valid status.')
         raw = result.stdout or b''
-        if len(raw) > max_output_bytes + max_entries + 1:
+        if len(raw) > max_output_bytes:
             raise SpriteSandboxError('Directory helper returned more data than its configured limit.')
         records = raw.split(b'\0')
         if records[-1] != b'':

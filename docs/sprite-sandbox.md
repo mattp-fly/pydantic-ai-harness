@@ -95,7 +95,10 @@ do not share one between overlapping runs that need isolation.
 Every command gets a finite deadline. `default_command_timeout` supplies the
 normal limit and `max_command_timeout` caps model-supplied values. The command
 runs in a process group inside the Sprite, so a timeout terminates the shell and
-its child processes.
+its child processes. A successful command can deliberately detach a background
+process (for example, `server &`) before the foreground shell exits. That process
+keeps running until it is explicitly stopped or the Sprite is destroyed; this is
+part of the persistent-computer behavior, not a timeout escape.
 
 The in-Sprite byte cut preserves the beginning and end of combined stdout and
 stderr before the SDK returns them. The tool layer then applies
@@ -104,9 +107,11 @@ tail where diagnostics commonly appear. All cuts are marked where the configured
 limit has enough room for the marker. After timeout or exit annotations are
 added, the final command result is clamped again to both configured caps.
 
-`read_file` uses a size-limited read inside the Sprite, so the SDK never buffers
-more than `max_read_bytes`. `list_directory` also applies its entry and byte
-limits inside the Sprite before returning data to the SDK.
+`read_file` uses a size-limited read inside the Sprite, and `list_directory`
+applies its entry and byte limits there before returning data. All command-helper
+responses also flow through bounded SDK streaming sinks. Those host-side sinks
+abort the response if a helper executable inside the mutable Sprite is replaced
+and tries to bypass its in-Sprite limit.
 
 The Fly.io Sprites Python SDK is synchronous. The capability runs its calls in worker
 threads, so SDK requests do not block the agent event loop.

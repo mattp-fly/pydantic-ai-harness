@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from typing import Annotated, Literal
 
@@ -33,6 +34,12 @@ def _strictly_bound_output(
         lines = lines[:-1]
     result = truncate(lines, max_lines=max_lines, max_bytes=max_bytes, direction=direction)
     return '\n'.join(result.truncated_lines)
+
+
+def _render_directory_entry(name: str, *, is_dir: bool) -> str:
+    """Escape line delimiters and controls so one filesystem entry stays on one output line."""
+    escaped = json.dumps(name, ensure_ascii=False)[1:-1]
+    return f'{escaped}/' if is_dir else escaped
 
 
 class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
@@ -202,12 +209,18 @@ class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
             raise
         except SpriteSandboxError as e:
             raise ModelRetry(str(e))
-        return render_file_window(
+        output = render_file_window(
             data,
             offset=offset,
             limit=limit,
             max_lines=self._max_output_lines,
             max_bytes=self._max_output_bytes,
+        )
+        return _strictly_bound_output(
+            output,
+            max_lines=self._max_output_lines,
+            max_bytes=self._max_output_bytes,
+            direction='head',
         )
 
     async def write_file(self, path: str, content: str) -> str:
@@ -228,7 +241,12 @@ class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
             raise
         except SpriteSandboxError as e:
             raise ModelRetry(str(e))
-        return f'Wrote {len(data)} bytes to {path!r}.'
+        return _strictly_bound_output(
+            f'Wrote {len(data)} bytes to {path!r}.',
+            max_lines=self._max_output_lines,
+            max_bytes=self._max_output_bytes,
+            direction='head',
+        )
 
     async def list_directory(self, path: str = '.') -> str:
         """List entries in a Sprite directory, with `/` after directory names.
@@ -248,8 +266,13 @@ class SpriteSandboxToolset(FunctionToolset[AgentDepsT]):
         except SpriteSandboxError as e:
             raise ModelRetry(str(e))
         if not listing.entries and not listing.truncated:
-            return '(empty)'
-        names = [f'{name}/' if is_dir else name for name, is_dir in sorted(listing.entries)]
+            return _strictly_bound_output(
+                '(empty)',
+                max_lines=self._max_output_lines,
+                max_bytes=self._max_output_bytes,
+                direction='head',
+            )
+        names = [_render_directory_entry(name, is_dir=is_dir) for name, is_dir in sorted(listing.entries)]
         output = '\n'.join(names)
         if listing.truncated:
             output = f'[... directory listing truncated ...]\n{output}'

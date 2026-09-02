@@ -161,7 +161,7 @@ class TestTools:
                 await tools.run_command('echo')
 
     async def test_file_tools(self, fake_sprites: FakeSprites) -> None:
-        async with _toolset(max_output_lines=2) as tools:
+        async with _toolset(max_output_lines=4) as tools:
             assert await tools.write_file('dir/file.txt', 'one\ntwo\nthree') == "Wrote 13 bytes to 'dir/file.txt'."
             assert await tools.read_file('dir/file.txt', offset=2, limit=1) == (
                 'two\n\n[1 more lines in file. Use offset=3 to continue.]'
@@ -186,6 +186,22 @@ class TestTools:
     async def test_empty_directory(self, fake_sprites: FakeSprites) -> None:
         async with _toolset() as tools:
             assert await tools.list_directory('/empty') == '(empty)'
+
+    async def test_file_tool_results_honor_tiny_final_caps(self, fake_sprites: FakeSprites) -> None:
+        async with _toolset(max_output_bytes=1, max_output_lines=1) as tools:
+            write_result = await tools.write_file('multi.txt', 'one\ntwo')
+            read_result = await tools.read_file('multi.txt')
+            empty_result = await tools.list_directory('/empty')
+        for result in (write_result, read_result, empty_result):
+            assert len(result.encode()) <= 1
+            assert len(result.splitlines()) <= 1
+
+    async def test_directory_entry_delimiters_are_escaped(self, fake_sprites: FakeSprites) -> None:
+        async with _toolset() as tools:
+            await tools.write_file('old\nreport.txt', 'content')
+            result = await tools.list_directory('.')
+        assert result == r'old\nreport.txt'
+        assert len(result.splitlines()) == 1
 
     async def test_file_error_becomes_model_retry(self, fake_sprites: FakeSprites) -> None:
         async with _toolset() as tools:

@@ -25,6 +25,15 @@ class FakeTimeoutError(FakeSpriteError):
     pass
 
 
+class FakeExitError(FakeSpriteError):
+    def __init__(self, returncode: int) -> None:
+        super().__init__(f'exit status {returncode}')
+        self._returncode = returncode
+
+    def exit_code(self) -> int:
+        return self._returncode
+
+
 @dataclass
 class FakeExecResult:
     stdout: bytes | None = b''
@@ -45,6 +54,41 @@ class RunCall:
 class FakeStat:
     size: int
     is_dir: bool = False
+
+
+class FakeCommand:
+    def __init__(
+        self,
+        sprite: FakeSprite,
+        argv: tuple[str, ...],
+        *,
+        stdout: Any,
+        stderr: Any,
+        timeout: float | None,
+        env: dict[str, str] | None,
+        cwd: str | None,
+    ) -> None:
+        self._sprite = sprite
+        self._argv = argv
+        self._stdout = stdout
+        self._stderr = stderr
+        self._timeout = timeout
+        self._env = env
+        self._cwd = cwd
+
+    def run(self) -> None:
+        result = self._sprite.run(
+            *self._argv,
+            timeout=self._timeout,
+            env=self._env,
+            cwd=self._cwd,
+        )
+        if result.stdout:
+            self._stdout.write(result.stdout)
+        if result.stderr:
+            self._stderr.write(result.stderr)
+        if result.returncode:
+            raise FakeExitError(result.returncode)
 
 
 class FakePath:
@@ -140,6 +184,28 @@ class FakeSprite:
             result.stderr = b'\0\0'
         return result
 
+    def command(
+        self,
+        *argv: str,
+        stdout: Any,
+        stderr: Any,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        **kwargs: Any,
+    ) -> FakeCommand:
+        if kwargs:
+            raise AssertionError(f'Unexpected Sprite.command kwargs: {kwargs}')
+        return FakeCommand(
+            self,
+            argv,
+            stdout=stdout,
+            stderr=stderr,
+            timeout=timeout,
+            env=env,
+            cwd=cwd,
+        )
+
     def _bounded_read(self, env: dict[str, str], cwd: str | None) -> FakeExecResult:
         self._raise_filesystem_error()
         path = self._resolve(env['PYDANTIC_AI_SPRITE_READ_PATH'], cwd)
@@ -168,17 +234,24 @@ class FakeSprite:
         max_bytes = int(env['PYDANTIC_AI_SPRITE_LIST_MAX_BYTES'])
         records: list[bytes] = []
         rendered_bytes = 0
+        wire_bytes = 0
         truncated = False
         for name in sorted(names):
             entry_path = posixpath.join(path, name)
             is_dir = entry_path in self.directories
             encoded = name.encode()
             rendered_cost = len(encoded) + int(is_dir) + int(bool(records))
-            if len(records) >= max_entries or rendered_bytes + rendered_cost > max_bytes:
+            wire_cost = len(encoded) + 2
+            if (
+                len(records) >= max_entries
+                or rendered_bytes + rendered_cost > max_bytes
+                or wire_bytes + wire_cost > max_bytes
+            ):
                 truncated = True
                 break
             records.append((b'D' if is_dir else b'F') + encoded + b'\0')
             rendered_bytes += rendered_cost
+            wire_bytes += wire_cost
         return FakeExecResult(stdout=b''.join(records), stderr=b'1' if truncated else b'0')
 
     def _resolve(self, path: str, cwd: str | None) -> str:
@@ -279,5 +352,6 @@ class FakeSprites:
         setattr(module, 'AuthenticationError', FakeAuthenticationError)
         setattr(module, 'NotFoundError', FakeNotFoundError)
         setattr(exceptions, 'TimeoutError', FakeTimeoutError)
+        setattr(exceptions, 'ExitError', FakeExitError)
         setattr(module, 'exceptions', exceptions)
         return module, exceptions

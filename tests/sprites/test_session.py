@@ -266,7 +266,7 @@ class TestOperations:
         assert call.argv[:4] == ('python3', '-I', '-S', '-c')
         assert "['bash', '-c', command]" in call.argv[4]
         assert "['bash', '-lc', command]" not in call.argv[4]
-        assert call.capture_output is True
+        assert call.capture_output is False
         assert call.timeout == 9.5
         assert call.cwd == '/app'
         assert call.env == {
@@ -314,14 +314,26 @@ class TestOperations:
         assert len(result.output.encode()) <= 1
         assert result.truncated is True
 
+    async def test_sdk_stream_is_aborted_when_helper_exceeds_transport_limit(self, fake_sprites: FakeSprites) -> None:
+        fake_sprites.responder = lambda call: FakeExecResult(stdout=b'unbounded')
+        async with SpriteSandboxSession(token='token') as session:
+            with pytest.raises(SpriteSandboxError, match='transport limit'):
+                await session.exec('big', timeout=2, max_output_bytes=2)
+
     async def test_file_roundtrip_and_listing(self, fake_sprites: FakeSprites) -> None:
         async with SpriteSandboxSession(token='token') as session:
             await session.write_bytes('sub/file.txt', b'hello')
-            assert await session.file_size('sub/file.txt') == 5
             assert await session.read_bytes('sub/file.txt', max_bytes=5) == b'hello'
             listing = await session.list_files('.', max_entries=10, max_output_bytes=100)
             assert listing.entries == [('sub', True)]
             assert listing.truncated is False
+
+    async def test_directory_transport_metadata_counts_toward_byte_limit(self, fake_sprites: FakeSprites) -> None:
+        async with SpriteSandboxSession(token='token') as session:
+            await session.write_bytes('a', b'x')
+            listing = await session.list_files('.', max_entries=10, max_output_bytes=1)
+        assert listing.entries == []
+        assert listing.truncated is True
 
     async def test_transient_sdk_failure_is_recoverable(self, fake_sprites: FakeSprites) -> None:
         async with SpriteSandboxSession(token='token') as session:
