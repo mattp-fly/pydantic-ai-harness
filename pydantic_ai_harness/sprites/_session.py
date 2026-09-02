@@ -500,7 +500,7 @@ class SpriteSandboxSession:
         )
         if result.returncode != 0 or not result.stdout:
             raise SpriteSandboxError(f'Could not determine the Sprite working directory (exit {result.returncode}).')
-        return result.stdout.decode('utf-8', errors='replace').strip()
+        return result.stdout.decode('utf-8', errors='replace').removesuffix('\n')
 
     async def _destroy_owned(self, client: SpritesClient, sprite_name: str, ownership_label: str) -> None:
         from sprites import NotFoundError

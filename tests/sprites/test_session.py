@@ -132,6 +132,13 @@ class TestLifecycle:
         assert len(fake_sprites.destroy_calls) == 1
         assert fake_sprites.close_calls == 1
 
+    async def test_cwd_probe_removes_only_pwd_record_newline(self, fake_sprites: FakeSprites) -> None:
+        fake_sprites.pwd_result = FakeExecResult(stdout=b'/workspace \n\n')
+        async with SpriteSandboxSession(token='token') as session:
+            await session.exec('pwd', timeout=1, max_output_bytes=100)
+            call = fake_sprites.sprites[session.sprite_name or ''].run_calls[-1]
+        assert call.cwd == '/workspace \n'
+
     async def test_failed_enter_reports_cleanup_failure(self, fake_sprites: FakeSprites) -> None:
         fake_sprites.pwd_result = FakeExecResult(returncode=1)
         fake_sprites.destroy_error = FakeSpriteError('destroy failed')

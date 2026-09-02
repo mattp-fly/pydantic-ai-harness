@@ -19,8 +19,9 @@ an existing Sprite or reuse one across several runs.
 Install the `sprites` extra and set a Fly.io Sprites API token:
 
 ```bash
-uv add "pydantic-ai-harness[sprites]"
+uv add "pydantic-ai-harness[sprites,anthropic]"
 export SPRITE_TOKEN=...
+export ANTHROPIC_API_KEY=...
 ```
 
 ```python
